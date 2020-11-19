@@ -1,5 +1,7 @@
 /*
- * Copyright (c) 2004-2008, 2010-2016 Todd C. Miller <Todd.Miller@courtesan.com>
+ * SPDX-License-Identifier: ISC
+ *
+ * Copyright (c) 2004-2008, 2010-2018 Todd C. Miller <Todd.Miller@sudo.ws>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,11 +16,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+/*
+ * This is an open source non-commercial project. Dear PVS-Studio, please check it.
+ * PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
+ */
+
 #include <config.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <stdio.h>
@@ -29,6 +35,7 @@
 #ifdef HAVE_STRINGS_H
 # include <strings.h>
 #endif /* HAVE_STRINGS_H */
+#include <time.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <errno.h>
@@ -37,12 +44,6 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
-#ifdef TIME_WITH_SYS_TIME
-# include <time.h>
-#endif
-#ifdef HAVE_SELINUX
-# include <selinux/selinux.h>
-#endif
 
 #include "sudo.h"
 #include "sudo_exec.h"
@@ -61,40 +62,6 @@ struct tempfile {
 
 static char edit_tmpdir[MAX(sizeof(_PATH_VARTMP), sizeof(_PATH_TMP))];
 
-/*
- * Find our temporary directory, one of /var/tmp, /usr/tmp, or /tmp
- * Returns true on success, else false;
- */
-static bool
-set_tmpdir(void)
-{
-    const char *tdir;
-    struct stat sb;
-    size_t len;
-    debug_decl(set_tmpdir, SUDO_DEBUG_EDIT)
-
-    if (stat(_PATH_VARTMP, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-	tdir = _PATH_VARTMP;
-    }
-#ifdef _PATH_USRTMP
-    else if (stat(_PATH_USRTMP, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-	tdir = _PATH_USRTMP;
-    }
-#endif
-    else {
-	tdir = _PATH_TMP;
-    }
-    len = strlcpy(edit_tmpdir, tdir, sizeof(edit_tmpdir));
-    if (len >= sizeof(edit_tmpdir)) {
-	errno = ENAMETOOLONG;
-	sudo_warn("%s", tdir);
-	debug_return_bool(false);
-    }
-    while (len > 0 && edit_tmpdir[--len] == '/')
-	edit_tmpdir[len] = '\0';
-    debug_return_bool(true);
-}
-
 static void
 switch_user(uid_t euid, gid_t egid, int ngroups, GETGROUPS_T *groups)
 {
@@ -102,7 +69,8 @@ switch_user(uid_t euid, gid_t egid, int ngroups, GETGROUPS_T *groups)
     debug_decl(switch_user, SUDO_DEBUG_EDIT)
 
     sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-	"set uid:gid to %u:%u(%u)", euid, egid, ngroups ? groups[0] : egid);
+	"set uid:gid to %u:%u(%u)", (unsigned int)euid, (unsigned int)egid,
+	ngroups ? (unsigned int)groups[0] : (unsigned int)egid);
 
     /* When restoring root, change euid first; otherwise change it last. */
     if (euid == ROOT_UID) {
@@ -117,11 +85,162 @@ switch_user(uid_t euid, gid_t egid, int ngroups, GETGROUPS_T *groups)
     }
     if (euid != ROOT_UID) {
 	if (seteuid(euid) != 0)
-	    sudo_fatal("seteuid(%d)", (int)euid);
+	    sudo_fatal("seteuid(%u)", (unsigned int)euid);
     }
     errno = serrno;
 
     debug_return;
+}
+
+#ifdef HAVE_FACCESSAT
+/*
+ * Returns true if the open directory fd is owned or writable by the user.
+ */
+static int
+dir_is_writable(int dfd, struct user_details *ud, struct command_details *cd)
+{
+    struct stat sb;
+    int rc;
+    debug_decl(dir_is_writable, SUDO_DEBUG_EDIT)
+
+    if (fstat(dfd, &sb) == -1)
+	debug_return_int(-1);
+
+    /* If the user owns the dir we always consider it writable. */
+    if (sb.st_uid == ud->uid) {
+	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
+	    "user uid %u matches directory uid %u", (unsigned int)ud->uid,
+	    (unsigned int)sb.st_uid);
+	debug_return_int(true);
+    }
+
+    /* Change uid/gid/groups to invoking user, usually needs root perms. */
+    if (cd->euid != ROOT_UID) {
+	if (seteuid(ROOT_UID) != 0)
+	    sudo_fatal("seteuid(ROOT_UID)");
+    }
+    switch_user(ud->uid, ud->gid, ud->ngroups, ud->groups);
+
+    /* Access checks are done using the euid/egid and group vector. */
+    rc = faccessat(dfd, ".", W_OK, AT_EACCESS);
+
+    /* Change uid/gid/groups back to target user, may need root perms. */
+    if (ud->uid != ROOT_UID) {
+	if (seteuid(ROOT_UID) != 0)
+	    sudo_fatal("seteuid(ROOT_UID)");
+    }
+    switch_user(cd->euid, cd->egid, cd->ngroups, cd->groups);
+
+    if (rc == 0)
+	debug_return_int(true);
+    if (errno == EACCES || errno == EROFS)
+	debug_return_int(false);
+    debug_return_int(-1);
+}
+#else
+static bool
+group_matches(gid_t target, gid_t gid, int ngroups, GETGROUPS_T *groups)
+{
+    int i;
+    debug_decl(group_matches, SUDO_DEBUG_EDIT)
+
+    if (target == gid) {
+	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
+	    "user gid %u matches directory gid %u", (unsigned int)gid,
+	    (unsigned int)target);
+	debug_return_bool(true);
+    }
+    for (i = 0; i < ngroups; i++) {
+	if (target == groups[i]) {
+	    sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
+		"user gid %u matches directory gid %u", (unsigned int)gid,
+		(unsigned int)target);
+	    debug_return_bool(true);
+	}
+    }
+    debug_return_bool(false);
+}
+
+/*
+ * Returns true if the open directory fd is owned or writable by the user.
+ */
+static int
+dir_is_writable(int dfd, struct user_details *ud, struct command_details *cd)
+{
+    struct stat sb;
+    debug_decl(dir_is_writable, SUDO_DEBUG_EDIT)
+
+    if (fstat(dfd, &sb) == -1)
+	debug_return_int(-1);
+
+    /* If the user owns the dir we always consider it writable. */
+    if (sb.st_uid == ud->uid) {
+	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
+	    "user uid %u matches directory uid %u", (unsigned int)ud->uid,
+	    (unsigned int)sb.st_uid);
+	debug_return_int(true);
+    }
+
+    /* Other writable? */
+    if (ISSET(sb.st_mode, S_IWOTH)) {
+	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
+	    "directory is writable by other");
+	debug_return_int(true);
+    }
+
+    /* Group writable? */
+    if (ISSET(sb.st_mode, S_IWGRP)) {
+	if (group_matches(sb.st_gid, ud->gid, ud->ngroups, ud->groups)) {
+	    sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
+		"directory is writable by one of the user's groups");
+	    debug_return_int(true);
+	}
+    }
+
+    errno = EACCES;
+    debug_return_int(false);
+}
+#endif /* HAVE_FACCESSAT */
+
+/*
+ * Find our temporary directory, one of /var/tmp, /usr/tmp, or /tmp
+ * Returns true on success, else false;
+ */
+static bool
+set_tmpdir(struct command_details *command_details)
+{
+    const char *tdir = NULL;
+    const char *tmpdirs[] = {
+	_PATH_VARTMP,
+#ifdef _PATH_USRTMP
+	_PATH_USRTMP,
+#endif
+	_PATH_TMP
+    };
+    unsigned int i;
+    size_t len;
+    int dfd;
+    debug_decl(set_tmpdir, SUDO_DEBUG_EDIT)
+
+    for (i = 0; tdir == NULL && i < nitems(tmpdirs); i++) {
+	if ((dfd = open(tmpdirs[i], O_RDONLY)) != -1) {
+	    if (dir_is_writable(dfd, &user_details, command_details) == true)
+		tdir = tmpdirs[i];
+	    close(dfd);
+	}
+    }
+    if (tdir == NULL)
+	sudo_fatalx(U_("no writable temporary directory found"));
+   
+    len = strlcpy(edit_tmpdir, tdir, sizeof(edit_tmpdir));
+    if (len >= sizeof(edit_tmpdir)) {
+	errno = ENAMETOOLONG;
+	sudo_warn("%s", tdir);
+	debug_return_bool(false);
+    }
+    while (len > 0 && edit_tmpdir[--len] == '/')
+	edit_tmpdir[len] = '\0';
+    debug_return_bool(true);
 }
 
 /*
@@ -178,7 +297,7 @@ sudo_openat(int dfd, const char *path, int flags, mode_t mode)
 
     /* Restore cwd */
     if (fchdir(odfd) == -1)
-	sudo_fatal(_("unable to restore current working directory"));
+	sudo_fatal(U_("unable to restore current working directory"));
     close(odfd);
 
     debug_return_int(fd);
@@ -190,7 +309,7 @@ sudo_openat(int dfd, const char *path, int flags, mode_t mode)
 static int
 sudo_edit_openat_nofollow(int dfd, char *path, int oflags, mode_t mode)
 {
-    debug_decl(sudo_edit_open_nofollow, SUDO_DEBUG_EDIT)
+    debug_decl(sudo_edit_openat_nofollow, SUDO_DEBUG_EDIT)
 
     debug_return_int(openat(dfd, path, oflags|O_NOFOLLOW, mode));
 }
@@ -226,134 +345,75 @@ sudo_edit_is_symlink(int fd, char *path)
 static int
 sudo_edit_openat_nofollow(int dfd, char *path, int oflags, mode_t mode)
 {
-    struct stat sb1, sb2;
-    int fd;
+    int fd = -1, odfd = -1;
+    struct stat sb;
     debug_decl(sudo_edit_openat_nofollow, SUDO_DEBUG_EDIT)
 
-    fd = openat(dfd, path, oflags, mode);
-    if (fd == -1)
+    /* Save cwd and chdir to dfd */
+    if ((odfd = open(".", O_RDONLY)) == -1)
 	debug_return_int(-1);
+    if (fchdir(dfd) == -1) {
+	close(odfd);
+	debug_return_int(-1);
+    }
 
+    /*
+     * Check if path is a symlink.  This is racey but we detect whether
+     * we lost the race in sudo_edit_is_symlink() after the open.
+     */
+    if (lstat(path, &sb) == -1 && errno != ENOENT)
+	goto done;
+    if (S_ISLNK(sb.st_mode)) {
+	errno = ELOOP;
+	goto done;
+    }
+
+    fd = open(path, oflags, mode);
+    if (fd == -1)
+	goto done;
+
+    /*
+     * Post-open symlink check.  This will leave a zero-length file if
+     * O_CREAT was specified but it is too dangerous to try and remove it.
+     */
     if (sudo_edit_is_symlink(fd, path)) {
 	close(fd);
 	fd = -1;
 	errno = ELOOP;
     }
 
+done:
+    /* Restore cwd */
+    if (odfd != -1) {
+	if (fchdir(odfd) == -1)
+	    sudo_fatal(U_("unable to restore current working directory"));
+	close(odfd);
+    }
+
     debug_return_int(fd);
 }
 #endif /* O_NOFOLLOW */
-
-#ifdef HAVE_FACCESSAT
-/*
- * Returns true if the open directory fd is writable by the user.
- */
-static int
-dir_is_writable(int dfd, struct user_details *ud, struct command_details *cd)
-{
-    debug_decl(dir_is_writable, SUDO_DEBUG_EDIT)
-    int rc;
-
-    /* Change uid/gid/groups to invoking user, usually needs root perms. */
-    if (cd->euid != ROOT_UID) {
-	if (seteuid(ROOT_UID) != 0)
-	    sudo_fatal("seteuid(ROOT_UID)");
-    }
-    switch_user(ud->uid, ud->gid, ud->ngroups, ud->groups);
-
-    /* Access checks are done using the euid/egid and group vector. */
-    rc = faccessat(dfd, ".", W_OK, AT_EACCESS);
-
-    /* Change uid/gid/groups back to target user, may need root perms. */
-    if (ud->uid != ROOT_UID) {
-	if (seteuid(ROOT_UID) != 0)
-	    sudo_fatal("seteuid(ROOT_UID)");
-    }
-    switch_user(cd->euid, cd->egid, cd->ngroups, cd->groups);
-
-    if (rc == 0)
-	debug_return_int(true);
-    if (errno == EACCES)
-	debug_return_int(false);
-    debug_return_int(-1);
-}
-#else
-static bool
-group_matches(gid_t target, gid_t gid, int ngroups, GETGROUPS_T *groups)
-{
-    int i;
-    debug_decl(group_matches, SUDO_DEBUG_EDIT)
-
-    if (target == gid) {
-	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-	    "user gid %u matches directory gid %u", (unsigned int)gid,
-	    (unsigned int)target);
-	debug_return_bool(true);
-    }
-    for (i = 0; i < ngroups; i++) {
-	if (target == groups[i]) {
-	    sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-		"user gid %u matches directory gid %u", (unsigned int)gid,
-		(unsigned int)target);
-	    debug_return_bool(true);
-	}
-    }
-    debug_return_bool(false);
-}
-
-/*
- * Returns true if the open directory fd is writable by the user.
- */
-static int
-dir_is_writable(int dfd, struct user_details *ud, struct command_details *cd)
-{
-    struct stat sb;
-    debug_decl(dir_is_writable, SUDO_DEBUG_EDIT)
-
-    if (fstat(dfd, &sb) == -1)
-	debug_return_int(-1);
-
-    /* If the user owns the dir we always consider it writable. */
-    if (sb.st_uid == ud->uid) {
-	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-	    "user uid %u matches directory uid %u", (unsigned int)ud->uid,
-	    (unsigned int)sb.st_uid);
-	debug_return_int(true);
-    }
-
-    /* Other writable? */
-    if (ISSET(sb.st_mode, S_IWOTH)) {
-	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-	    "directory is writable by other");
-	debug_return_int(true);
-    }
-
-    /* Group writable? */
-    if (ISSET(sb.st_mode, S_IWGRP)) {
-	if (group_matches(sb.st_gid, ud->gid, ud->ngroups, ud->groups)) {
-	    sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-		"directory is writable by one of the user's groups");
-	    debug_return_int(true);
-	}
-    }
-
-    errno = EACCES;
-    debug_return_int(false);
-}
-#endif /* HAVE_FACCESSAT */
 
 /*
  * Directory open flags for use with openat(2).
  * Use O_SEARCH/O_PATH and/or O_DIRECTORY where possible.
  */
 #if defined(O_SEARCH)
-# define DIR_OPEN_FLAGS	(O_SEARCH|O_DIRECTORY)
+# if defined(O_DIRECTORY)
+#  define DIR_OPEN_FLAGS	(O_SEARCH|O_DIRECTORY)
+# else
+#  define DIR_OPEN_FLAGS	(O_SEARCH)
+# endif
 #elif defined(O_PATH)
-# define DIR_OPEN_FLAGS	(O_PATH|O_DIRECTORY)
+# if defined(O_DIRECTORY)
+#  define DIR_OPEN_FLAGS	(O_PATH|O_DIRECTORY)
+# else
+#  define DIR_OPEN_FLAGS	(O_PATH)
+# endif
 #elif defined(O_DIRECTORY)
-# define DIR_OPEN_FLAGS	(O_RDONLY|O_DIRECTORY)
+# define DIR_OPEN_FLAGS		(O_RDONLY|O_DIRECTORY)
 #else
-# define DIR_OPEN_FLAGS	(O_RDONLY|O_NONBLOCK)
+# define DIR_OPEN_FLAGS		(O_RDONLY|O_NONBLOCK)
 #endif
 
 static int
@@ -450,9 +510,22 @@ sudo_edit_open(char *path, int oflags, mode_t mode,
     struct command_details *command_details)
 {
     const int sflags = command_details ? command_details->flags : 0;
-    struct stat sb1, sb2;
+    struct stat sb;
     int fd;
     debug_decl(sudo_edit_open, SUDO_DEBUG_EDIT)
+
+    /*
+     * Check if path is a symlink.  This is racey but we detect whether
+     * we lost the race in sudo_edit_is_symlink() after the file is opened.
+     */
+    if (!ISSET(sflags, CD_SUDOEDIT_FOLLOW)) {
+	if (lstat(path, &sb) == -1 && errno != ENOENT)
+	    debug_return_int(-1);
+	if (S_ISLNK(sb.st_mode)) {
+	    errno = ELOOP;
+	    debug_return_int(-1);
+	}
+    }
 
     if (ISSET(sflags, CD_SUDOEDIT_CHECKDIR) && user_details.uid != ROOT_UID) {
 	fd = sudo_edit_open_nonwritable(path, oflags|O_NONBLOCK, mode,
@@ -465,6 +538,10 @@ sudo_edit_open(char *path, int oflags, mode_t mode,
     if (!ISSET(oflags, O_NONBLOCK))
 	(void) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK);
 
+    /*
+     * Post-open symlink check.  This will leave a zero-length file if
+     * O_CREAT was specified but it is too dangerous to try and remove it.
+     */
     if (!ISSET(sflags, CD_SUDOEDIT_FOLLOW) && sudo_edit_is_symlink(fd, path)) {
 	close(fd);
 	fd = -1;
@@ -500,7 +577,8 @@ sudo_edit_create_tfiles(struct command_details *command_details,
 	rc = -1;
 	switch_user(command_details->euid, command_details->egid,
 	    command_details->ngroups, command_details->groups);
-	ofd = sudo_edit_open(files[i], O_RDONLY, 0644, command_details);
+	ofd = sudo_edit_open(files[i], O_RDONLY,
+	    S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH, command_details);
 	if (ofd != -1 || errno == ENOENT) {
 	    if (ofd == -1) {
 		/* New file, verify parent dir exists unless in cwd. */
@@ -548,9 +626,9 @@ sudo_edit_create_tfiles(struct command_details *command_details,
 	tf[j].osize = sb.st_size;
 	mtim_get(&sb, tf[j].omtim);
 	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-	    "seteuid(%u)", user_details.uid);
+	    "seteuid(%u)", (unsigned int)user_details.uid);
 	if (seteuid(user_details.uid) != 0)
-	    sudo_fatal("seteuid(%d)", (int)user_details.uid);
+	    sudo_fatal("seteuid(%u)", (unsigned int)user_details.uid);
 	tfd = sudo_edit_mktemp(tf[j].ofile, &tf[j].tfile);
 	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
 	    "seteuid(%u)", ROOT_UID);
@@ -616,16 +694,18 @@ sudo_edit_copy_tfiles(struct command_details *command_details,
     ssize_t nwritten, nread;
     struct timespec ts;
     struct stat sb;
+    mode_t oldmask;
     debug_decl(sudo_edit_copy_tfiles, SUDO_DEBUG_EDIT)
 
     /* Copy contents of temp files to real ones. */
     for (i = 0; i < nfiles; i++) {
 	rc = -1;
 	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
-	    "seteuid(%u)", user_details.uid);
+	    "seteuid(%u)", (unsigned int)user_details.uid);
 	if (seteuid(user_details.uid) != 0)
-	    sudo_fatal("seteuid(%d)", (int)user_details.uid);
-	tfd = sudo_edit_open(tf[i].tfile, O_RDONLY, 0644, NULL);
+	    sudo_fatal("seteuid(%u)", (unsigned int)user_details.uid);
+	tfd = sudo_edit_open(tf[i].tfile, O_RDONLY,
+	    S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH, NULL);
 	if (tfd != -1)
 	    rc = fstat(tfd, &sb);
 	sudo_debug_printf(SUDO_DEBUG_INFO|SUDO_DEBUG_LINENO,
@@ -653,14 +733,15 @@ sudo_edit_copy_tfiles(struct command_details *command_details,
 		sudo_warnx(U_("%s unchanged"), tf[i].ofile);
 		unlink(tf[i].tfile);
 		close(tfd);
-		errors++;
 		continue;
 	    }
 	}
 	switch_user(command_details->euid, command_details->egid,
 	    command_details->ngroups, command_details->groups);
-	ofd = sudo_edit_open(tf[i].ofile, O_WRONLY|O_TRUNC|O_CREAT, 0644,
-	    command_details);
+	oldmask = umask(command_details->umask);
+	ofd = sudo_edit_open(tf[i].ofile, O_WRONLY|O_TRUNC|O_CREAT,
+	    S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH, command_details);
+	umask(oldmask);
 	switch_user(ROOT_UID, user_details.egid,
 	    user_details.ngroups, user_details.groups);
 	if (ofd == -1) {
@@ -766,11 +847,11 @@ selinux_edit_create_tfiles(struct command_details *command_details,
     case SESH_SUCCESS:
 	break;
     case SESH_ERR_BAD_PATHS:
-	sudo_fatalx(_("sesh: internal error: odd number of paths"));
+	sudo_fatalx(U_("sesh: internal error: odd number of paths"));
     case SESH_ERR_NO_FILES:
-	sudo_fatalx(_("sesh: unable to create temporary files"));
+	sudo_fatalx(U_("sesh: unable to create temporary files"));
     default:
-	sudo_fatalx(_("sesh: unknown error %d"), rc);
+	sudo_fatalx(U_("sesh: unknown error %d"), rc);
     }
 
     /* Restore saved command_details. */
@@ -797,7 +878,7 @@ selinux_edit_copy_tfiles(struct command_details *command_details,
     struct tempfile *tf, int nfiles, struct timespec *times)
 {
     char **sesh_args, **sesh_ap;
-    int i, rc, sesh_nargs, rval = 1;
+    int i, rc, sesh_nargs, ret = 1;
     struct command_details saved_command_details;
     struct timespec ts;
     struct stat sb;
@@ -857,18 +938,18 @@ selinux_edit_copy_tfiles(struct command_details *command_details,
 	rc = run_command(command_details);
 	switch (rc) {
 	case SESH_SUCCESS:
-	    rval = 0;
+	    ret = 0;
 	    break;
 	case SESH_ERR_NO_FILES:
-	    sudo_warnx(_("unable to copy temporary files back to their original location"));
+	    sudo_warnx(U_("unable to copy temporary files back to their original location"));
 	    sudo_warnx(U_("contents of edit session left in %s"), edit_tmpdir);
 	    break;
 	case SESH_ERR_SOME_FILES:
-	    sudo_warnx(_("unable to copy some of the temporary files back to their original location"));
+	    sudo_warnx(U_("unable to copy some of the temporary files back to their original location"));
 	    sudo_warnx(U_("contents of edit session left in %s"), edit_tmpdir);
 	    break;
 	default:
-	    sudo_warnx(_("sesh: unknown error %d"), rc);
+	    sudo_warnx(U_("sesh: unknown error %d"), rc);
 	    break;
 	}
     }
@@ -879,26 +960,27 @@ selinux_edit_copy_tfiles(struct command_details *command_details,
     command_details->flags = saved_command_details.flags;
     command_details->argv = saved_command_details.argv;
 
-    debug_return_int(rval);
+    debug_return_int(ret);
 }
 #endif /* HAVE_SELINUX */
 
 /*
  * Wrapper to allow users to edit privileged files with their own uid.
- * Returns 0 on success and 1 on failure.
+ * Returns the wait status of the command on success and a wait status
+ * of 1 on failure.
  */
 int
 sudo_edit(struct command_details *command_details)
 {
     struct command_details saved_command_details;
     char **nargv = NULL, **ap, **files = NULL;
-    int errors, i, ac, nargc, rval;
+    int errors, i, ac, nargc, rc;
     int editor_argc = 0, nfiles = 0;
     struct timespec times[2];
     struct tempfile *tf = NULL;
     debug_decl(sudo_edit, SUDO_DEBUG_EDIT)
 
-    if (!set_tmpdir())
+    if (!set_tmpdir(command_details))
 	goto cleanup;
 
     /*
@@ -977,7 +1059,7 @@ sudo_edit(struct command_details *command_details)
     command_details->ngroups = user_details.ngroups;
     command_details->groups = user_details.groups;
     command_details->argv = nargv;
-    rval = run_command(command_details);
+    rc = run_command(command_details);
     if (sudo_gettime_real(&times[1]) == -1) {
 	sudo_warn(U_("unable to read the clock"));
 	goto cleanup;
@@ -999,12 +1081,14 @@ sudo_edit(struct command_details *command_details)
     else
 #endif
 	errors = sudo_edit_copy_tfiles(command_details, tf, nfiles, times);
+    if (errors)
+	goto cleanup;
 
     for (i = 0; i < nfiles; i++)
 	free(tf[i].tfile);
     free(tf);
     free(nargv);
-    debug_return_int(errors ? 1 : rval);
+    debug_return_int(rc);
 
 cleanup:
     /* Clean up temp files and return. */
@@ -1016,7 +1100,7 @@ cleanup:
     }
     free(tf);
     free(nargv);
-    debug_return_int(1);
+    debug_return_int(W_EXITCODE(1, 0));
 }
 
 #else /* HAVE_SETRESUID || HAVE_SETREUID || HAVE_SETEUID */
@@ -1028,7 +1112,7 @@ int
 sudo_edit(struct command_details *command_details)
 {
     debug_decl(sudo_edit, SUDO_DEBUG_EDIT)
-    debug_return_int(1);
+    debug_return_int(W_EXITCODE(1, 0));
 }
 
 #endif /* HAVE_SETRESUID || HAVE_SETREUID || HAVE_SETEUID */

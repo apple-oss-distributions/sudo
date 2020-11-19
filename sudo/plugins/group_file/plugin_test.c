@@ -1,5 +1,7 @@
 /*
- * Copyright (c) 2010-2013 Todd C. Miller <Todd.Miller@courtesan.com>
+ * SPDX-License-Identifier: ISC
+ *
+ * Copyright (c) 2010-2013 Todd C. Miller <Todd.Miller@sudo.ws>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -12,6 +14,11 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * This is an open source non-commercial project. Dear PVS-Studio, please check it.
+ * PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
  */
 
 #include <sys/types.h>
@@ -83,8 +90,10 @@ group_plugin_load(char *plugin_info)
 	savedch = *args;
 	*args = '\0';
     }
-    strncpy(path, plugin_info, sizeof(path) - 1);
-    path[sizeof(path) - 1] = '\0';
+    if (strlcpy(path, plugin_info, sizeof(path)) >= sizeof(path)) {
+	fprintf(stderr, "path too long: %s\n", plugin_info);
+	return -1;
+    }
     if (args != NULL)
 	*args++ = savedch;
 
@@ -113,7 +122,7 @@ group_plugin_load(char *plugin_info)
      */
     if (args != NULL) {
 	int ac = 0, wasblank = 1;
-	char *cp;
+	char *cp, *last;
 
         for (cp = args; *cp != '\0'; cp++) {
             if (isblank((unsigned char)*cp)) {
@@ -124,16 +133,18 @@ group_plugin_load(char *plugin_info)
             }
         }
 	if (ac != 0) 	{
-	    char *last;
-
-	    argv = malloc(ac * sizeof(char *));
+	    argv = malloc((ac + 1) * sizeof(char *));
 	    if (argv == NULL) {
 		perror(NULL);
 		return -1;
 	    }
 	    ac = 0;
-	    for ((cp = strtok_r(args, " \t", &last)); cp != NULL; (cp = strtok_r(NULL, " \t", &last)))
+	    cp = strtok_r(args, " \t", &last);
+	    while (cp != NULL) {
 		argv[ac++] = cp;
+		cp = strtok_r(NULL, " \t", &last);
+	    }
+	    argv[ac] = NULL;
 	}
     }
 

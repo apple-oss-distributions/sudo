@@ -1,5 +1,7 @@
 /*
- * Copyright (c) 2010, 2012-2014 Todd C. Miller <Todd.Miller@courtesan.com>
+ * SPDX-License-Identifier: ISC
+ *
+ * Copyright (c) 2010, 2012-2014 Todd C. Miller <Todd.Miller@sudo.ws>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -12,6 +14,11 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * This is an open source non-commercial project. Dear PVS-Studio, please check it.
+ * PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
  */
 
 #include <config.h>
@@ -160,6 +167,12 @@ sudo_dso_strerror_v1(void)
 #  define RTLD_GLOBAL	0
 # endif
 
+#ifdef __APPLE_DYNAMIC_LV__
+#include <System/sys/codesign.h>
+#include <unistd.h>
+#include <fcntl.h>
+#endif /* __APPLE_DYNAMIC_LV__ */
+
 void *
 sudo_dso_load_v1(const char *path, int mode)
 {
@@ -183,7 +196,35 @@ sudo_dso_load_v1(const char *path, int mode)
 	flags |= RTLD_GLOBAL;
     if (ISSET(mode, SUDO_DSO_LOCAL))
 	flags |= RTLD_LOCAL;
+	
+#ifdef __APPLE_DYNAMIC_LV__
+    void *dlh = dlopen(path, flags);
+    if (dlh != NULL || faccessat(AT_FDCWD, path, R_OK, AT_EACCESS) != 0)
+        return dlh;
+	
+    /*
+     * The module exists and is readable, but failed to load.
+     * If library validation is enabled, try disabling it and then re-attempt loading again.
+     */
+    int csflags = 0;
+    int rv = 0;
+    pid_t pid = getpid();
+    rv = csops(pid, CS_OPS_STATUS, &csflags, sizeof(csflags));
+    if (rv != 0 || (csflags & (CS_FORCED_LV | CS_REQUIRE_LV)) == 0)
+	return NULL;
 
+    rv = csops(pid, CS_OPS_CLEAR_LV, NULL, 0);
+    if (rv != 0)
+	return NULL;
+    
+    dlh = dlopen(path, flags);
+    if (dlh == NULL) {
+	/* Failed to load even with LV disabled: re-enable LV. */
+	csflags = CS_REQUIRE_LV;
+	(void)csops(pid, CS_OPS_SET_STATUS, &csflags, sizeof(csflags));
+    }
+    return dlh;
+#endif /* __APPLE_DYNAMIC_LV__ */
     return dlopen(path, flags);
 }
 

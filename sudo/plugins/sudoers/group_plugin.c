@@ -1,5 +1,7 @@
 /*
- * Copyright (c) 2010-2015 Todd C. Miller <Todd.Miller@courtesan.com>
+ * SPDX-License-Identifier: ISC
+ *
+ * Copyright (c) 2010-2019 Todd C. Miller <Todd.Miller@sudo.ws>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,11 +16,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+/*
+ * This is an open source non-commercial project. Dear PVS-Studio, please check it.
+ * PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
+ */
+
 #include <config.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef HAVE_STRING_H
@@ -28,9 +34,7 @@
 # include <strings.h>
 #endif /* HAVE_STRINGS_H */
 #include <unistd.h>
-#ifdef TIME_WITH_SYS_TIME
-# include <time.h>
-#endif
+#include <time.h>
 #include <ctype.h>
 #include <errno.h>
 #include <pwd.h>
@@ -70,7 +74,7 @@ group_plugin_load(char *plugin_info)
 	len = snprintf(path, sizeof(path), "%s%s",
 	    (*plugin_info != '/') ? path_plugin_dir : "", plugin_info);
     }
-    if (len <= 0 || (size_t)len >= sizeof(path)) {
+    if (len < 0 || len >= ssizeof(path)) {
 	errno = ENAMETOOLONG;
 	sudo_warn("%s%s",
 	    (*plugin_info != '/') ? path_plugin_dir : "", plugin_info);
@@ -129,14 +133,19 @@ group_plugin_load(char *plugin_info)
             }
         }
 	if (ac != 0) {
-	    argv = reallocarray(NULL, ac, sizeof(char *));
+	    argv = reallocarray(NULL, ac + 1, sizeof(char *));
 	    if (argv == NULL) {
-		sudo_warnx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
+		sudo_warnx(U_("%s: %s"), __func__,
+		    U_("unable to allocate memory"));
 		goto done;
 	    }
 	    ac = 0;
-	    for ((cp = strtok_r(args, " \t", &last)); cp != NULL; (cp = strtok_r(NULL, " \t", &last)))
+	    cp = strtok_r(args, " \t", &last);
+	    while (cp != NULL) {
 		argv[ac++] = cp;
+		cp = strtok_r(NULL, " \t", &last);
+	    }
+	    argv[ac] = NULL;
 	}
     }
 
@@ -212,3 +221,19 @@ group_plugin_query(const char *user, const char *group,
 }
 
 #endif /* HAVE_DLOPEN || HAVE_SHL_LOAD */
+
+/*
+ * Group plugin sudoers callback.
+ */
+bool
+cb_group_plugin(const union sudo_defs_val *sd_un)
+{
+    bool rc = true;
+    debug_decl(cb_group_plugin, SUDOERS_DEBUG_PLUGIN)
+
+    /* Unload any existing group plugin before loading a new one. */
+    group_plugin_unload();
+    if (sd_un->str != NULL)
+	rc = group_plugin_load(sd_un->str);
+    debug_return_bool(rc);
+}
